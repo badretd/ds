@@ -34,21 +34,29 @@ The date is returned by the LLM as an ISO date and formatted by the script, whic
 
 PDF pages are rendered to images with PyMuPDF, so no poppler installation is needed.
 
-## Install
+## Install & Run
 
+**Option 1: Run as Python package (development)**
 ```
 pip install -r requirements.txt
-```
-
-## Run
-
-```
 python invoice_renamer.py              # settings UI
 python invoice_renamer.py --headless   # no window, uses config.json
+python invoice_renamer.py --setup      # guided setup wizard
 python invoice_renamer.py --config D:\invoices\config.json
 ```
 
+**Option 2: Run as standalone executable (production)**
+```
+./dist/invoice-renamer              # settings UI
+./dist/invoice-renamer --headless   # no window, uses config.json
+./dist/invoice-renamer --setup      # guided setup wizard
+```
+
+The executable is built with PyInstaller and includes all dependencies.
+
 In the UI: pick the **watch folder**, check the other tabs, press **Test Ollama**, then **▶ Start**. Settings are saved to `config.json` next to the script. **Scan once** processes the current contents of the folder a single time. The **Log** tab shows progress; the same output goes to `invoice_renamer.log`.
+
+First-time users can run `--setup` for a guided setup wizard that helps configure everything.
 
 For a permanent background service, run `--headless` from Task Scheduler (Windows), systemd, or launchd.
 
