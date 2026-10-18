@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from .config import Config
+from .config import Config, KNOWN_KEYS
 
 log = logging.getLogger("invoice_renamer")
 
@@ -58,6 +58,45 @@ def normalize_supplier(value: str) -> str:
     return s
 
 
+def _coerce_custom(val, typ: str, cfg: Config):
+    """Приведение значения кастомного поля к заявленному типу.
+
+    При неудаче возвращаем исходную строку — лучше сохранить хоть
+    что-то, чем потерять данные.
+    """
+    s = str(val).strip() if val is not None else ""
+    if not s:
+        return ""
+    if typ == "integer":
+        try:
+            return int(float(s))
+        except (ValueError, TypeError):
+            return s
+    if typ == "number":
+        try:
+            return float(s)
+        except (ValueError, TypeError):
+            return s
+    if typ == "boolean":
+        return s.lower() in ("1", "true", "yes", "да", "y", "t")
+    if typ == "date":
+        d = parse_date(s)
+        return d.strftime(cfg.date_format) if d else s
+    if typ == "datetime":
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S",
+            "%d.%m.%Y %H:%M:%S",
+            "%d.%m.%Y %H:%M",
+        ):
+            try:
+                return datetime.strptime(s, fmt).strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+        return s
+    return s
+
+
 def normalize_fields(cfg: Config, data: dict, hints: dict | None = None) -> dict:
     hints = hints or {}
 
@@ -82,11 +121,30 @@ def normalize_fields(cfg: Config, data: dict, hints: dict | None = None) -> dict
             f"Could not extract: {', '.join(missing)} "
             f"(LLM={data!r}, hints={hints!r})"
         )
+
+    # Кастомные поля (не KNOWN_KEYS) приводим к типу.
+    # Тип «null» не заполняем вовсе — это служебная колонка.
+    for col in cfg.table_columns:
+        key = col["key"]
+        if key in KNOWN_KEYS or key in fields_:
+            continue
+        if col.get("type") == "null":
+            continue
+        fields_[key] = _coerce_custom(
+            data.get(key, ""), col.get("type", "string"), cfg
+        )
+
     return fields_
 
 
 def build_filename(cfg: Config, fields_: dict) -> str:
-    stem = cfg.filename_template.format(**fields_)
+    class _SafeDict(dict):
+        def __missing__(self, key: str) -> str:
+            # Плейсхолдер без значения (например, «null»-колонка или
+            # поле, которое LLM не вернуло) — подставляем пустую строку.
+            return ""
+
+    stem = cfg.filename_template.format_map(_SafeDict(fields_))
     stem = FORBIDDEN.sub("", stem)
     stem = re.sub(r"\s+", " ", stem).strip(" .")
     stem = stem[: cfg.max_name_len].rstrip(" .")

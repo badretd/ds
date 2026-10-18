@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
+from string import Formatter
 
 
 # --------------------------------------------------------------------------- #
@@ -14,7 +16,11 @@ def _default_app_dir() -> Path:
     env = os.environ.get("INVOICE_RENAMER_HOME")
     if env:
         return Path(env).expanduser().resolve()
-    # config.py лежит в <app>/invoice_renamer/config.py → <app> — родитель пакета
+    # PyInstaller: __file__ указывает во временную папку _MEIPASS,
+    # поэтому берём каталог, где лежит сам EXE.
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    # Обычный запуск: config.py лежит в <app>/invoice_renamer/config.py
     return Path(__file__).resolve().parent.parent
 
 
@@ -37,6 +43,7 @@ META_FIELDS = ("original_name", "new_name", "processed_at")
 
 # Заголовки по умолчанию для «известных» ключей
 KNOWN_HEADERS = {
+    "id": "ID",
     "date": "Дата",
     "supplier": "Поставщик",
     "invoice": "Номер счёта",
@@ -44,6 +51,22 @@ KNOWN_HEADERS = {
     "original_name": "Исходное имя файла",
     "new_name": "Новое имя файла",
     "processed_at": "Обработано",
+}
+KNOWN_KEYS = set(KNOWN_HEADERS.keys())
+
+# Допустимые типы колонок.
+# «null» — служебная колонка: присутствует в таблице, но не заполняется ни LLM,
+# ни программой (кроме случая, когда пользователь сам впишет туда значение).
+FIELD_TYPES = ("string", "integer", "number", "date", "datetime", "boolean", "null")
+DEFAULT_FIELD_TYPES = {
+    "id": "integer",
+    "date": "string",
+    "supplier": "string",
+    "invoice": "string",
+    "material": "string",
+    "original_name": "string",
+    "new_name": "string",
+    "processed_at": "datetime",
 }
 
 
@@ -130,9 +153,11 @@ class Config:
     table_enabled: bool = True
     table_path: str = ""
     table_create_if_missing: bool = True
-    # Список словарей {"key": str, "header": str}. Ключ может быть любым:
-    # известным (date/supplier/invoice/material/original_name/new_name/processed_at)
-    # или произвольным — тогда значение будет пустым.
+    table_auto_id: bool = True
+    # Список словарей {"key": str, "header": str, "type": str, "description": str}.
+    # Ключ может быть известным (date/supplier/invoice/material/... ) или
+    # произвольным — тогда это кастомное поле, которое уходит в LLM.
+    # Тип «null» — колонка есть в таблице, но не заполняется автоматически.
     table_columns: list = field(default_factory=lambda: [
         {"key": k, "header": v} for k, v in KNOWN_HEADERS.items()
     ])
@@ -152,7 +177,7 @@ def load_config(path: Path | None = None) -> Config:
         for f in fields(Config):
             if f.name in data:
                 setattr(cfg, f.name, data[f.name])
-    # Гарантируем корректный тип колонок (на случай «старого» формата)
+    # Миграция старых форматов + гарантия корректного типа колонок
     cfg.table_columns = _coerce_columns(cfg.table_columns)
     return cfg
 
@@ -170,64 +195,195 @@ class ConfigError(Exception):
 # --------------------------------------------------------------------------- #
 # Columns helpers
 # --------------------------------------------------------------------------- #
-def _coerce_columns(value) -> list[dict]:
-    """Приводим table_columns к списку {"key","header"}.
+def normalize_column(col) -> dict:
+    """Приводим одну колонку к канону: {key, header, type, description}."""
+    if isinstance(col, str):
+        if "|" in col:
+            parts = [p.strip() for p in col.split("|")]
+            key = parts[0] if parts else ""
+            header = parts[1] if len(parts) > 1 else ""
+            typ = parts[2] if len(parts) > 2 and parts[2] else None
+            desc = parts[3] if len(parts) > 3 else ""
+            col = {"key": key, "header": header, "description": desc}
+            if typ:
+                col["type"] = typ
+        else:
+            col = {"key": col.strip()}
 
-    Поддерживаем: список dict, список строк (ключи), строку «a, b, c».
-    """
+    if not isinstance(col, dict):
+        return {}
+
+    key = str(col.get("key", "")).strip()
+    header = str(col.get("header", "")).strip()
+
+    # Миграция старого формата: «key | header» хранился прямо в ключе
+    if "|" in key:
+        k, _, h = key.partition("|")
+        key = k.strip()
+        if not header or "|" in header:
+            header = h.strip()
+
+    if not key:
+        return {}
+    if not header:
+        header = KNOWN_HEADERS.get(key, key)
+
+    typ = col.get("type") or DEFAULT_FIELD_TYPES.get(key, "string")
+    if typ not in FIELD_TYPES:
+        typ = "string"
+
+    return {
+        "key": key,
+        "header": header,
+        "type": typ,
+        "description": str(col.get("description", "")).strip(),
+    }
+
+
+def _coerce_columns(value) -> list[dict]:
+    """Приводим table_columns к списку канонических dict."""
     if not value:
         return []
     if isinstance(value, str):
         value = [x.strip() for x in value.split(",") if x.strip()]
     out: list[dict] = []
     for item in value:
-        if isinstance(item, dict):
-            key = str(item.get("key", "")).strip()
-            header = str(item.get("header", "")).strip() or KNOWN_HEADERS.get(key, key)
-        else:
-            key = str(item).strip()
-            header = KNOWN_HEADERS.get(key, key)
-        if key:
-            out.append({"key": key, "header": header})
+        col = normalize_column(item)
+        if col:
+            out.append(col)
     return out
 
 
 def parse_columns(text: str) -> list[dict]:
-    """Разбор текстового представления колонок: 'key | Заголовок' на строку."""
-    return _coerce_columns([
-        line.strip() for line in text.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ])
+    """Разбор текстового представления колонок.
+
+    Строки: ``key | Заголовок`` или ``key | Заголовок | тип | описание``.
+    Пустые строки и строки, начинающиеся с ``#``, пропускаются.
+    """
+    out: list[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.lstrip().startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        while len(parts) < 4:
+            parts.append("")
+        col = normalize_column({
+            "key": parts[0],
+            "header": parts[1],
+            "type": parts[2] or None,
+            "description": parts[3],
+        })
+        if col:
+            out.append(col)
+    return out
 
 
 def format_columns(cols: list[dict]) -> str:
-    return "\n".join(f"{c['key']} | {c['header']}" for c in cols)
+    """Обратное к parse_columns: одна колонка — одна строка."""
+    lines: list[str] = []
+    for c in cols:
+        parts = [c["key"], c["header"]]
+        typ = c.get("type", "")
+        desc = c.get("description", "")
+        show_typ = bool(typ) and typ != DEFAULT_FIELD_TYPES.get(c["key"], "string")
+        if show_typ or desc:
+            parts.append(typ if show_typ else "")
+        if desc:
+            parts.append(desc)
+        lines.append(" | ".join(parts))
+    return "\n".join(lines)
+
+
+def custom_fields(cfg: "Config") -> list[dict]:
+    """Все колонки, которых нет в KNOWN_HEADERS."""
+    return [c for c in cfg.table_columns if c["key"] not in KNOWN_KEYS]
+
+
+def llm_fields(cfg: "Config") -> list[dict]:
+    """Кастомные поля, которые должен заполнять LLM.
+
+    Исключаем тип «null» — это служебные колонки, LLM их не касается.
+    """
+    return [c for c in custom_fields(cfg) if c.get("type") != "null"]
+
+
+def build_system_prompt(cfg: "Config") -> str:
+    """Дополняем системный промпт инструкциями для кастомных полей."""
+    prompt = cfg.system_prompt
+    custom = llm_fields(cfg)
+    if not custom:
+        return prompt
+    lines = [
+        "",
+        "",
+        "ДОПОЛНИТЕЛЬНЫЕ ПОЛЯ.",
+        "Извлеки их из документа и добавь в JSON-ответ.",
+        "Если поле не найдено — верни пустую строку.",
+    ]
+    for c in custom:
+        typ = c.get("type", "string")
+        desc = c.get("description") or c.get("header") or c["key"]
+        lines.append(f"- {c['key']} (тип: {typ}): {desc}")
+    return prompt + "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
 # Validation
 # --------------------------------------------------------------------------- #
+def _template_placeholders(template: str) -> set[str]:
+    names: set[str] = set()
+    for _, fieldname, _, _ in Formatter().parse(template):
+        if fieldname:
+            names.add(fieldname.split(".", 1)[0].split("[", 1)[0])
+    return names
+
+
 def validate_config(cfg: Config) -> None:
     if REQUIRED_TOKEN not in cfg.filename_template:
         raise ConfigError(f"The filename template must contain “{REQUIRED_TOKEN}”.")
-    try:
-        cfg.filename_template.format(**{k: "x" for k in TEMPLATE_FIELDS})
-    except (KeyError, IndexError, ValueError) as e:
+
+    cols = _coerce_columns(cfg.table_columns)
+    custom_keys = {c["key"] for c in cols} - KNOWN_KEYS
+    allowed = set(TEMPLATE_FIELDS) | custom_keys
+
+    placeholders = _template_placeholders(cfg.filename_template)
+
+    if "id" in placeholders:
         raise ConfigError(
-            f"Bad filename template ({e!r}). Allowed placeholders: "
-            + ", ".join("{%s}" % k for k in TEMPLATE_FIELDS)
+            "«{id}» нельзя использовать в шаблоне имени файла: ID присваивается "
+            "при записи строки в таблицу — уже после переименования файла."
         )
+    unknown = placeholders - allowed
+    if unknown:
+        raise ConfigError(
+            "Unknown placeholders in filename template: "
+            + ", ".join(sorted(unknown))
+            + ". Allowed: "
+            + ", ".join(sorted(allowed))
+            + "."
+        )
+
+    try:
+        cfg.filename_template.format(**{k: "x" for k in allowed})
+    except (KeyError, IndexError, ValueError) as e:
+        raise ConfigError(f"Bad filename template ({e!r}).")
+
     try:
         datetime(2024, 9, 26).strftime(cfg.date_format)
     except ValueError as e:
         raise ConfigError(f"Bad date format: {e}")
 
-    cols = _coerce_columns(cfg.table_columns)
     if not cols:
         raise ConfigError("Table columns must not be empty.")
     for col in cols:
         if not col.get("key") or not col.get("header"):
             raise ConfigError("Each table column must have both key and header.")
+        if col.get("type") not in FIELD_TYPES:
+            raise ConfigError(
+                f"Unknown column type {col.get('type')!r} for "
+                f"column {col['key']!r}. Allowed: {', '.join(FIELD_TYPES)}."
+            )
 
     for name in ("poll_seconds", "ocr_dpi", "max_pages", "num_ctx", "timeout", "max_chars"):
         if int(getattr(cfg, name)) <= 0:

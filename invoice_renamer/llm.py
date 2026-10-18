@@ -4,23 +4,34 @@ from __future__ import annotations
 import json
 import logging
 
-from .config import Config
+from .config import (
+    Config,
+    build_system_prompt,
+    llm_fields,
+)
 from .extractor import ServiceUnavailable
 from .normalizer import ExtractionError
 
 log = logging.getLogger("invoice_renamer")
 
 
-SCHEMA = {
-    "type": "object",
-    "properties": {
+def build_schema(cfg: Config) -> dict:
+    """Динамическая JSON-схема: базовые поля + кастомные (не «null»)."""
+    props = {
         "date": {"type": "string"},
         "supplier": {"type": "string"},
         "invoice_number": {"type": "string"},
         "material": {"type": "string"},
-    },
-    "required": ["date", "supplier", "invoice_number", "material"],
-}
+    }
+    for c in llm_fields(cfg):
+        # Кастомные поля всегда запрашиваем строкой — приводить к числу/дате
+        # будет normalizer. Так модель не спотыкается о строгие типы.
+        props[c["key"]] = {"type": "string"}
+    return {
+        "type": "object",
+        "properties": props,
+        "required": ["date", "supplier", "invoice_number", "material"],
+    }
 
 
 def ask_llm(cfg: Config, text: str) -> dict:
@@ -29,15 +40,15 @@ def ask_llm(cfg: Config, text: str) -> dict:
     payload = {
         "model": cfg.model,
         "stream": False,
-        "format": SCHEMA,
+        "format": build_schema(cfg),
         "keep_alive": cfg.keep_alive,
         "options": {
             "temperature": 0,
             "num_ctx": cfg.num_ctx,
-            "num_predict": 256,
+            "num_predict": 512,
         },
         "messages": [
-            {"role": "system", "content": cfg.system_prompt},
+            {"role": "system", "content": build_system_prompt(cfg)},
             {"role": "user", "content": 'Текст документа:\n"""\n' + text[: cfg.max_chars] + '\n"""'},
         ],
     }

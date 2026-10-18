@@ -13,6 +13,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from .config import (
     CONFIG_PATH,
     DEFAULT_SYSTEM_PROMPT,
+    KNOWN_KEYS,
     Config,
     ConfigError,
     format_columns,
@@ -50,7 +51,6 @@ class App(tk.Tk):
     # Layout
     # ------------------------------------------------------------------ #
     def _build(self) -> None:
-        # ---- toolbar -----------------------------------------------------
         bar = ttk.Frame(self, padding=(10, 8))
         bar.pack(fill="x")
 
@@ -70,7 +70,6 @@ class App(tk.Tk):
         self.status = ttk.Label(bar, text="Stopped", foreground="gray")
         self.status.pack(side="right")
 
-        # ---- notebook ----------------------------------------------------
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True, padx=10, pady=(0, 6))
 
@@ -114,7 +113,6 @@ class App(tk.Tk):
         t = self._tab("LLM (Ollama)")
         self._row(t, "ollama_url", "Ollama URL", "str")
 
-        # Модель: combobox + кнопка обновления (вручную, т.к. нужен свой layout)
         r = t._r
         t._r += 2
         ttk.Label(t, text="Model").grid(
@@ -147,7 +145,9 @@ class App(tk.Tk):
             t, wraplength=840, justify="left", foreground="gray",
             text=("Системный промпт, отправляемый LLM. Правьте осторожно: "
                   "модель должна вернуть JSON с полями date, supplier, "
-                  "invoice_number, material."),
+                  "invoice_number, material.\n"
+                  "Кастомные поля из вкладки Table подставляются автоматически, "
+                  "их руками в промпт добавлять не нужно."),
         ).grid(row=0, column=0, sticky="w", pady=(0, 6))
 
         self.prompt_text = scrolledtext.ScrolledText(t, wrap="word", height=20)
@@ -155,17 +155,20 @@ class App(tk.Tk):
         self.prompt_text.insert("1.0", self.cfg.system_prompt)
         self.text_widgets["system_prompt"] = self.prompt_text
 
+        # Кнопки под промптом: сброс + сохранить
         row = ttk.Frame(t)
         row.grid(row=2, column=0, sticky="ew", pady=(6, 0))
         ttk.Button(row, text="Сбросить к стандартному",
                    command=self.reset_prompt).pack(side="left")
+        ttk.Button(row, text="💾 Сохранить", command=self.save).pack(
+            side="left", padx=(6, 0))
 
     # ---- Naming ----------------------------------------------------------
     def _build_naming_tab(self) -> None:
         t = self._tab("Naming")
         self._row(t, "filename_template", "Filename template", "str",
-                  "Placeholders: {date} {supplier} {invoice} {material}. "
-                  "“Сч” is required.")
+                  "Placeholders: {date} {supplier} {invoice} {material} + любые "
+                  "кастомные ключи из вкладки Table. «Сч» обязателен.")
         self._row(t, "date_format", "Date format", "str",
                   "strftime: %d%m%y → 260924")
         self._row(t, "invoice_cyrillic", "Latin look-alikes → Cyrillic", "bool",
@@ -187,15 +190,31 @@ class App(tk.Tk):
         self._row(t, "table_path", "Table file (.xlsx / .csv)", "table")
         self._row(t, "table_create_if_missing",
                   "Create file if it does not exist", "bool")
+        self._row(t, "table_auto_id",
+                  "Auto-generate ID for each row", "bool",
+                  "Для новой таблицы добавит колонку «ID»; для существующей — "
+                  "использует столбец ID/№/номер, если он есть.")
 
         info_row = t._r
         t._r += 1
         ttk.Label(
             t, wraplength=840, justify="left",
-            text=("Колонки таблицы: одна строка на колонку, формат "
-                  "«key | Заголовок». Известные ключи: date, supplier, "
-                  "invoice, material, original_name, new_name, processed_at. "
-                  "Можно добавлять свои — значения будут пустыми."),
+            text=(
+                "Колонки таблицы: одна строка на колонку.\n"
+                "Формат: «ключ | Заголовок» или «ключ | Заголовок | тип | описание».\n"
+                "Стандартные ключи: id, date, supplier, invoice, material, "
+                "original_name, new_name, processed_at.\n"
+                "Свой ключ (например, contract) автоматически попадёт в "
+                "системный промпт LLM и будет заполняться из документа.\n"
+                "Типы: string, integer, number, date, datetime, boolean, null.\n"
+                "Тип «null» — колонка есть в таблице, но не заполняется "
+                "автоматически (служебная: примечание, проверено и т. п.).\n"
+                "Описание — подсказка для LLM (что именно извлекать).\n\n"
+                "Примеры:\n"
+                "  contract | Договор | string | Номер договора поставки\n"
+                "  total    | Сумма    | number | Итоговая сумма счёта\n"
+                "  note     | Примечание | null | Заполняется вручную"
+            ),
         ).grid(row=info_row, column=0, columnspan=3, sticky="w", pady=(8, 4))
 
         text_row = t._r
@@ -204,6 +223,11 @@ class App(tk.Tk):
         self.columns_text.grid(row=text_row, column=0, columnspan=3, sticky="nsew")
         self.columns_text.insert("1.0", format_columns(self.cfg.table_columns))
         self.text_widgets["table_columns"] = self.columns_text
+
+        # Кнопка сохранения под колонками
+        btn_row = ttk.Frame(t)
+        btn_row.grid(row=text_row + 1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        ttk.Button(btn_row, text="💾 Сохранить", command=self.save).pack(side="left")
 
     # ---- Log -------------------------------------------------------------
     def _build_log_tab(self) -> None:
@@ -327,6 +351,21 @@ class App(tk.Tk):
             "invoice": "КА-16339",
             "material": "металл",
         }
+        for c in cfg.table_columns:
+            key = c["key"]
+            if key in KNOWN_KEYS:
+                continue
+            if c.get("type") == "null":
+                sample[key] = ""
+                continue
+            typ = c.get("type", "string")
+            sample[key] = {
+                "integer": "42",
+                "number": "1234.56",
+                "date": "26.09.2024",
+                "datetime": "2024-09-26 12:00:00",
+                "boolean": "True",
+            }.get(typ, "X")
         self.preview_lbl.config(text=build_filename(cfg, sample))
 
     def reset_prompt(self) -> None:
